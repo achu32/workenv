@@ -1,0 +1,299 @@
+# Overview
+# --------
+#
+# This is a non-recursive Makefile for running vifm tests using stic.
+#
+# Vifm is built before running any tests as its object files are used for tests.
+# Necessary include and link directives are picked up from the main Makefile.
+#
+# Each test-suite (directory) is run in a separate sandbox directory.  During
+# compilation two defines are available:
+#  - TEST_DATA_PATH -- path to test-data/ directory (might be RO)
+#  - SANDBOX_PATH   -- path to sandbox for the suite (always RW)
+#
+# Test suites can be run concurrently.
+#
+# Usage
+# -----
+#
+# By default tests are built in release mode.
+#
+# make              -- builds and runs all tests
+# make build        -- builds all tests without running them
+# make <dir>        -- runs specific test suite
+# make <dir>.<name> -- runs specific fixture
+#
+# make DEBUG=1 ...        -- builds debug version
+# make DEBUG=gdb ...      -- builds debug version and loads suite into gdb
+# make DEBUG=valgrind ... -- builds debug version and run it under valgrind (see
+#                            valgrind-report file after a run)
+#
+# make VERBOSE=1 ... -- print all build commands
+#
+# make TEST_RUN_PREFIX=wine -- run command prefix
+#
+# make clean -- removes various built artifacts
+#
+# "B" variable might be set to build tree root to run tests out of the source
+# tree.
+
+# determine kind of OS that is running
+ifeq ($(OS),Windows_NT)
+    ifeq ($(shell uname -o 2> /dev/null),Cygwin)
+        unix_env := true
+    else
+        win_env := true
+    endif
+else
+    ifeq ($(CROSS),)
+        unix_env := true
+    else
+        win_env := true
+    endif
+endif
+
+ifdef DEBUG
+    BINSUBDIR := debug/
+endif
+
+# path to build tree
+B ?=
+# path to storage for intermediate build files
+BUILD := $(B)bin/build/$(BINSUBDIR)
+
+# engine
+suites += abbrevs autocmds commands completion keys options parsing text_buffer
+suites += variables
+# io
+suites += ioeta ionotif iop ior
+# ui
+suites += colmgr column_view viewcolumns_parser
+# everything else
+suites += bmarks env escape fileops filetype filter misc undo utils
+
+# obtain list of sources that are being tested
+vifm_src := ./ cfg/ compat/ engine/ int/ io/ io/private/ modes/dialogs/ menus/
+vifm_src += modes/ ui/ utils/
+vifm_src := $(wildcard $(addprefix ../src/, $(addsuffix *.c, $(vifm_src))))
+vifm_src := $(filter-out %/tags.c %/xxhash.c, $(vifm_src))
+
+# filter out generally non-testable or sources for another platform
+vifm_src := $(filter-out %/vifm.c %/win_helper.c, $(vifm_src))
+ifndef unix_env
+    vifm_src := $(filter-out %/desktop.c %/mntent.c %_nix.c, $(vifm_src))
+endif
+ifndef win_env
+    vifm_src := $(filter-out %/wcwidth.c %/volumes_menu.c %_win.c, $(vifm_src))
+endif
+
+vifm_bin := $(B)../src/vifm$(exe_suffix)
+vifm_obj := $(B)../src/./tags.o $(vifm_src:%.c=$(B)%.o) $(BUILD)stubs.o
+
+# make sure that there is one compile_info.c object file in the list
+vifm_obj := $(filter-out %/compile_info.o, $(vifm_obj))
+vifm_obj += $(B)../src/compile_info.o
+
+ifdef unix_env
+    make_args := -C $(B)../src/
+endif
+ifdef win_env
+    make_args  := -C $(B)../src/ -f $(abspath ../src/Makefile.win)
+    exe_suffix := .exe
+endif
+
+CC = gcc
+
+# handling of verbosity (non-verbose by default)
+ifdef VERBOSE
+    V = 1
+else
+    V = 0
+endif
+ACTUAL_CC := $(CC)
+CC_0 = @echo "Compiling $@..."; $(ACTUAL_CC)
+CC_1 = $(ACTUAL_CC)
+LD_0 = @echo "Linking $@..."; $(ACTUAL_CC)
+LD_1 = $(ACTUAL_CC)
+AT_0 = @
+AT_1 =
+# redefine commands according to verbosity state
+override CC = $(CC_$(V))
+override LD = $(LD_$(V))
+AT = $(AT_$(V))
+
+# setup compile and link flags (partially depends on OS)
+override CFLAGS := $(CFLAGS) -MMD -pipe -Wall -Wno-char-subscripts \
+                   -Istic/ -include $(B)../config.h -fsigned-char -DTEST \
+                   -D_XOPEN_SOURCE -D_XOPEN_SOURCE_EXTENDED \
+                   -D_FILE_OFFSET_BITS=64
+override LDFLAGS := $(LDFLAGS) -lpthread
+ifeq (,$(findstring clang,$(CC)))
+    # clang is inconvenient with regard to this flag, don't do coverage with it
+    override LDFLAGS += --coverage
+endif
+ifdef unix_env
+    MF := $(B)../src/Makefile
+    ifneq ($(wildcard $(MF)),)
+        override LDFLAGS += \
+            $(shell grep -m1    'LIBS =' $(MF) | sed 's/^[^=]*=//') \
+            $(shell grep -m1 'LDFLAGS =' $(MF) | sed 's/^[^=]*=//')
+
+        override CFLAGS  += \
+            $(shell grep -m1          'CPPFLAGS =' $(MF) | sed 's/^[^=]*=//') \
+            $(shell grep -m1      'TESTS_CFLAGS =' $(MF) | sed 's/^[^=]*=//') \
+            $(shell grep -m1 'SANITIZERS_CFLAGS =' $(MF) | sed 's/^[^=]*=//')
+    endif
+
+    override CFLAGS += -I/usr/include/ncursesw
+    export UBSAN_OPTIONS := halt_on_error=1
+endif
+ifdef win_env
+    override LDFLAGS += \
+        $(shell sed -n '/LIBS :=/{s/^[^=]\+=//p;q}' ../src/Makefile.win)
+    # this part is in conditional
+    ifeq ($(OS),Windows_NT)
+        override LDFLAGS += -lpdcurses
+    else
+        override LDFLAGS += -lcurses
+    endif
+endif
+
+ifdef DEBUG
+    override CFLAGS += -g -O0
+    override LDFLAGS += -g
+    ifdef unix_env
+        override LDFLAGS += -rdynamic
+    endif
+
+    ifeq ($(DEBUG),gdb)
+        TEST_RUN_PREFIX := gdb -q --args
+    endif
+    ifeq ($(DEBUG),valgrind)
+        TEST_RUN_PREFIX := valgrind --track-origins=yes --leak-check=full \
+                           --log-file=valgrind-report --error-exitcode=5 \
+                           --suppressions=$(abspath .)/../.valgrind.supp
+        TEST_RUN_POST := || (e=$$$$?; if [ $$$$e -eq 5 ]; then \
+                                          cat valgrind-report; \
+                                      fi; \
+                                      exit $$$$e)
+    endif
+endif
+
+.PHONY: check build clean $(suites)
+
+# check and build targets are defined mostly in suite_template
+check: build
+
+clean:
+	$(RM) -r $(B)bin/ $(SANDBOX_PATH)/
+	$(RM) $(B)stic/stic.h.d $(B)stic/stic.h.gch
+
+# disable implicit rules to prevent compiling main sources here
+.SUFFIXES:
+
+$(vifm_obj) ../src/./tags.c: | $(vifm_bin)
+
+$(vifm_bin): $(vifm_src)
+	$(MAKE) $(make_args) vifm$(exe_suffix)
+
+$(BUILD)stubs.o: stubs.c
+	$(CC) -c -o $@ $(CFLAGS) $<
+
+$(BUILD)stic.o: stic/stic.c
+	$(CC) -c -o $@ $(CFLAGS) $<
+
+$(B)stic/stic.h.gch: stic/stic.h | $(B)stic
+# don't precompile header with clang (on OS X gcc is likely to be a symlink to
+# clang) because it handles macros in a different way
+ifeq (,$(findstring clang,$(CC)))
+ifneq (Darwin,$(shell uname -s))
+	$(CC) -c -o $@ $(CFLAGS) $<
+endif
+endif
+
+$(B)stic $(B)bin/$(BINSUBDIR):
+	$(AT)mkdir -p $@
+
+# this function of two arguments (array and element) returns index of the
+# element in the array
+pos = $(strip $(eval T := ) \
+              $(eval i := 0) \
+              $(foreach elem, $1, \
+                        $(if $(filter $2,$(elem)), \
+                             $(eval i := $(words $T)), \
+                             $(eval T := $T $(elem)))) \
+              $i)
+
+ifeq (,$(findstring wine,$(TEST_RUN_PREFIX)))
+    ifeq ($B,)
+        SANDBOX_PATH := $(abspath .)/sandbox
+    else
+        SANDBOX_PATH := $(B)sandbox
+    endif
+    TEST_DATA_PATH := $(abspath .)/test-data
+else
+    SANDBOX_PATH := sandbox
+    TEST_DATA_PATH := test-data
+endif
+
+
+# suite definition template, takes single argument: name of the suite
+define suite_template
+
+$1.src := $$(sort $$(wildcard $1/*.c))
+$1.obj := $$($1.src:%.c=$(BUILD)%.o)
+$1.bin := $(B)bin/$(BINSUBDIR)$1$(exe_suffix)
+$1.fixtures := $$(subst /,.,\
+                        $$(patsubst %.c,%,$$(filter-out %/suite.c,$$($1.src))))
+
+deps += $$($1.obj:.o=.d)
+
+$$($1.bin): $$($1.obj) $(BUILD)stic.o $(vifm_obj) \
+          | $(vifm_bin) $(B)bin/$(BINSUBDIR)
+	$$(LD) -o $$@ $$^ $(LDFLAGS)
+
+$(BUILD)$1/%.o: $1/%.c $(B)stic/stic.h.gch $(BUILD)$1/filelist \
+              | $(BUILD)$1 $(SANDBOX_PATH)/$1
+	$$(CC) -c -o $$@ -include stic/stic.h $(CFLAGS) \
+	                 -DTESTID=$$(call pos, $$($1.obj), $$@) \
+	                 -DMAXTESTID=$$(words $$($1.obj)) $$< \
+	                 -DSUITE_NAME="$1" \
+	                 -DTEST_DATA_PATH='"$(TEST_DATA_PATH)"' \
+	                 -DSANDBOX_PATH='"$(SANDBOX_PATH)/$1"' \
+
+$(BUILD)$1/filelist: $1/. | $(BUILD)$1
+	@if [ ! -f "$$@" -o "$$$$(cat $$@ 2> /dev/null)" != '$$($1.src)' ]; then \
+		echo -n '$$($1.src)' > $$@; \
+	fi
+
+$(BUILD)$1 $(SANDBOX_PATH)/$1:
+	$(AT)mkdir -p $$@
+
+$1: $$($1.bin)
+ifeq ($B,)
+	@$(TEST_RUN_PREFIX) $$^ -s $(TEST_RUN_POST)
+else
+	@cd $B && $(TEST_RUN_PREFIX) $$^ -s $(TEST_RUN_POST)
+endif
+
+# this runs separate fixtures, targets are of the form dir.name
+.PHONY: $$($1.fixtures)
+$$($1.fixtures): $$($1.bin)
+ifeq ($B,)
+	@$(TEST_RUN_PREFIX) $$^ -s -f $$(subst .,/,$$@).c $(TEST_RUN_POST)
+else
+	@cd $B && $(TEST_RUN_PREFIX) $$^ -s -f $$(subst .,/,$$@).c $(TEST_RUN_POST)
+endif
+
+build: $$($1.bin)
+
+check: $1
+
+endef
+
+# walk throw list of suites and instantiate template for each one
+$(foreach suite, $(suites), $(eval $(call suite_template,$(suite))))
+
+# import dependencies calculated by the compiler
+include $(wildcard $(deps) \
+                   $(B)bin/build/stic.d $(B)stic/stic.h.d $(B)bin/build/stubs.d)
